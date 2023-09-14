@@ -1,0 +1,962 @@
+-- 
+diff --git a/configure.ac b/configure.ac
+index 1008811823..6e907efbf7 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2619,6 +2619,9 @@ AS_CASE([$coroutine_type], [yes|''], [
+         [*86-mingw*], [
+             coroutine_type=win32
+         ],
++        [aarch64*-mingw*], [
++            coroutine_type=arm64
++        ],
+         [arm*-linux*], [
+             coroutine_type=arm32
+         ],
+diff --git a/include/ruby/win32.h b/include/ruby/win32.h
+index 197eb8a802..69925c6ce6 100644
+--- a/include/ruby/win32.h
++++ b/include/ruby/win32.h
+@@ -325,6 +325,7 @@ extern int rb_w32_uaccess(const char *, int);
+ extern char rb_w32_fd_is_text(int);
+ extern int rb_w32_fstati128(int, struct stati128 *);
+ extern int rb_w32_dup2(int, int);
++extern int rb_w32_setmode(int fd, int mode);
+ 
+ #include <float.h>
+ 
+@@ -401,11 +402,8 @@ extern int rb_w32_utruncate(const char *path, rb_off_t length);
+ 
+ #undef HAVE_FTRUNCATE
+ #define HAVE_FTRUNCATE 1
+-#if defined HAVE_FTRUNCATE64
+-#define ftruncate ftruncate64
+-#else
++#undef ftruncate
+ #define ftruncate rb_w32_ftruncate
+-#endif
+ 
+ #undef HAVE_TRUNCATE
+ #define HAVE_TRUNCATE 1
+diff --git a/io.c b/io.c
+index 4caf771b05..ab459265c0 100644
+--- a/io.c
++++ b/io.c
+@@ -175,6 +175,8 @@ off_t __syscall(quad_t number, ...);
+ #define open	rb_w32_uopen
+ #undef rename
+ #define rename(f, t)	rb_w32_urename((f), (t))
++#undef setmode
++#define setmode	rb_w32_setmode
+ #endif
+ 
+ VALUE rb_cIO;
+diff --git a/vm_dump.c b/vm_dump.c
+index e31d70c0e1..59c56093d2 100644
+--- a/vm_dump.c
++++ b/vm_dump.c
+@@ -727,6 +727,14 @@ dump_thread(void *arg)
+                     frame.AddrFrame.Offset = context.Rbp;
+                     frame.AddrStack.Mode = AddrModeFlat;
+                     frame.AddrStack.Offset = context.Rsp;
++#elif defined(__aarch64__)
++		            mac = IMAGE_FILE_MACHINE_ARM64;
++		            frame.AddrPC.Mode = AddrModeFlat;
++		            frame.AddrPC.Offset = context.Pc;
++		            frame.AddrFrame.Mode = AddrModeFlat;
++		            frame.AddrFrame.Offset = context.Fp;
++		            frame.AddrStack.Mode = AddrModeFlat;
++		            frame.AddrStack.Offset = context.Sp;
+ #else	/* i386 */
+                     mac = IMAGE_FILE_MACHINE_I386;
+                     frame.AddrPC.Mode = AddrModeFlat;
+diff --git a/win32/win32.c b/win32/win32.c
+index ca62fe6c6d..9ee38f1f1c 100644
+--- a/win32/win32.c
++++ b/win32/win32.c
+@@ -120,13 +120,15 @@ static char *w32_getenv(const char *name, UINT cp);
+ #define enough_to_get(n) (--(n) >= 0)
+ #define enough_to_put(n) (--(n) >= 0)
+ 
++// #define WIN32_DEBUG 1
+ #ifdef WIN32_DEBUG
+ #define Debug(something) something
+ #else
+ #define Debug(something) /* nothing */
+ #endif
+ 
+-#define TO_SOCKET(x)	_get_osfhandle(x)
++#define TO_SOCKET(x)	rb_w32_get_osfhandle(x)
++#define TO_HANDLE(x)	(HANDLE)rb_w32_get_osfhandle(x)
+ 
+ int rb_w32_reparse_symlink_p(const WCHAR *path);
+ 
+@@ -397,7 +399,7 @@ flock(int fd, int oper)
+     const asynchronous_func_t locker = flock_winnt;
+ 
+     return rb_w32_asynchronize(locker,
+-                              (VALUE)_get_osfhandle(fd), oper, NULL,
++                              (VALUE)rb_w32_get_osfhandle(fd), oper, NULL,
+                               (DWORD)-1);
+ }
+ 
+@@ -899,7 +901,7 @@ socklist_delete(SOCKET *sockp, int *flagp)
+ #  define _CrtSetReportMode(type,mode) ((void)0)
+ #  define _RTC_SetErrorFunc(func) ((void)0)
+ # endif
+-static void set_pioinfo_extra(void);
++//static void set_pioinfo_extra(void);
+ #endif
+ static int w32_cmdvector(const WCHAR *, char ***, UINT, rb_encoding *);
+ //
+@@ -914,7 +916,6 @@ rb_w32_sysinit(int *argc, char ***argv)
+     _CrtSetReportMode(_CRT_ASSERT, 0);
+     _set_invalid_parameter_handler(invalid_parameter);
+     _RTC_SetErrorFunc(rtc_error_handler);
+-    set_pioinfo_extra();
+ #endif
+     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
+ 
+@@ -1136,13 +1137,6 @@ internal_cmd_match(const char *cmdname, int nt)
+     return 1;
+ }
+ 
+-/* License: Ruby's */
+-SOCKET
+-rb_w32_get_osfhandle(int fh)
+-{
+-    return _get_osfhandle(fh);
+-}
+-
+ /* License: Ruby's */
+ static int
+ join_argv(char *cmd, char *const *argv, BOOL escape, UINT cp, int backslash)
+@@ -1299,6 +1293,7 @@ CreateChild(struct ChildRecord *child, const WCHAR *cmd, const WCHAR *prog, HAND
+     else {
+         aStartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+     }
++    Debug(fprintf(stderr, "CreateChild: stdin:(%p), stdout:(%p) stderr:(%p)\n", aStartupInfo.hStdInput, aStartupInfo.hStdOutput, aStartupInfo.hStdError));
+ 
+     dwCreationFlags |= NORMAL_PRIORITY_CLASS;
+ 
+@@ -2554,10 +2549,10 @@ typedef struct	{
+ #endif
+ 
+ #if RUBY_MSVCRT_VERSION >= 140
+-static ioinfo ** __pioinfo = NULL;
++// static ioinfo ** __pioinfo = NULL;
+ #define IOINFO_L2E 6
+ #else
+-EXTERN_C _CRTIMP ioinfo * __pioinfo[];
++//EXTERN_C _CRTIMP ioinfo * __pioinfo[];
+ #define IOINFO_L2E 5
+ #endif
+ static inline ioinfo* _pioinfo(int);
+@@ -2569,21 +2564,16 @@ static inline ioinfo* _pioinfo(int);
+ #define rb_acrt_lowio_lock_fh(i)   EnterCriticalSection(&_pioinfo(i)->lock)
+ #define rb_acrt_lowio_unlock_fh(i) LeaveCriticalSection(&_pioinfo(i)->lock)
+ 
+-#if RUBY_MSVCRT_VERSION >= 80
+-static size_t pioinfo_extra = 0;	/* workaround for VC++8 SP1 */
++#define _set_osfhnd(fh, osfh) (void)(_osfhnd(fh) = osfh)
++#define _set_osflags(fh, flags) (_osfile(fh) = (flags))
+ 
+-/* License: Ruby's */
+-static void
+-set_pioinfo_extra(void)
+-{
+-#if RUBY_MSVCRT_VERSION >= 140
+-# define FUNCTION_RET 0xc3 /* ret */
+-# ifdef _DEBUG
+-#  define UCRTBASE "ucrtbased.dll"
+-# else
+-#  define UCRTBASE "ucrtbase.dll"
+-# endif
+-    /* get __pioinfo addr with _isatty */
++#define FOPEN			0x01	/* file handle open */
++#define FEOFLAG			0x02	/* end of file has been encountered */
++#define FPIPE			0x08	/* file handle refers to a pipe */
++#define FNOINHERIT		0x10	/* file handle opened O_NOINHERIT */
++#define FAPPEND			0x20	/* file handle opened O_APPEND */
++#define FDEV			0x40	/* file handle refers to device */
++#define FTEXT			0x80	/* file handle is in text mode */
+     /*
+      * Why Ruby depends to _pioinfo is
+      * * to associate socket and fd: CRuby creates fd with dummy file handle
+@@ -2596,97 +2586,40 @@ set_pioinfo_extra(void)
+      * * https://bugs.ruby-lang.org/issues/11118
+      * * https://bugs.ruby-lang.org/issues/18605
+      */
+-    char *p = (char*)get_proc_address(UCRTBASE, "_isatty", NULL);
+-    char *pend = p;
+-    /* _osfile(fh) & FDEV */
+-
+-# ifdef _WIN64
+-    int32_t rel;
+-    char *rip;
+-    /* add rsp, _ */
+-#  define FUNCTION_BEFORE_RET_MARK "\x48\x83\xc4"
+-#  define FUNCTION_SKIP_BYTES 1
+-#  ifdef _DEBUG
+-    /* lea rcx,[__pioinfo's addr in RIP-relative 32bit addr] */
+-#   define PIOINFO_MARK "\x48\x8d\x0d"
+-#  else
+-    /* lea rdx,[__pioinfo's addr in RIP-relative 32bit addr] */
+-#   define PIOINFO_MARK "\x48\x8d\x15"
+-#  endif
+-
+-# else /* x86 */
+-    /* pop ebp */
+-#  define FUNCTION_BEFORE_RET_MARK "\x5d"
+-#  define FUNCTION_SKIP_BYTES 0
+-    /* mov eax,dword ptr [eax*4+100EB430h] */
+-#  define PIOINFO_MARK "\x8B\x04\x85"
+-# endif
+-    if (p) {
+-        for (pend += 10; pend < p + 300; pend++) {
+-            // find end of function
+-            if (memcmp(pend, FUNCTION_BEFORE_RET_MARK, sizeof(FUNCTION_BEFORE_RET_MARK) - 1) == 0 &&
+-                (*(pend + (sizeof(FUNCTION_BEFORE_RET_MARK) - 1) + FUNCTION_SKIP_BYTES) & FUNCTION_RET) == FUNCTION_RET) {
+-                // search backwards from end of function
+-                for (pend -= (sizeof(PIOINFO_MARK) - 1); pend > p; pend--) {
+-                    if (memcmp(pend, PIOINFO_MARK, sizeof(PIOINFO_MARK) - 1) == 0) {
+-                        p = pend;
+-                        goto found;
+-                    }
+-                }
+-                break;
+-            }
+-        }
+-    }
+-    fprintf(stderr, "unexpected " UCRTBASE "\n");
+-    _exit(1);
+-
+-    found:
+-    p += sizeof(PIOINFO_MARK) - 1;
+-#ifdef _WIN64
+-    rel = *(int32_t*)(p);
+-    rip = p + sizeof(int32_t);
+-    __pioinfo = (ioinfo**)(rip + rel);
+-#else
+-    __pioinfo = *(ioinfo***)(p);
+-#endif
+-#endif
+-    int fd;
+-
+-    fd = _open("NUL", O_RDONLY);
+-    for (pioinfo_extra = 0; pioinfo_extra <= 64; pioinfo_extra += sizeof(void *)) {
+-        if (_osfhnd(fd) == _get_osfhandle(fd)) {
+-            break;
+-        }
+-    }
+-    _close(fd);
+ 
+-    if (pioinfo_extra > 64) {
+-        /* not found, maybe something wrong... */
+-        pioinfo_extra = 0;
+-    }
+-}
+-#else
+-#define pioinfo_extra 0
+-#endif
++static ioinfo * __pioinfo = NULL;
++static int __pioinfo_size = 0;
+ 
+ static inline ioinfo*
+ _pioinfo(int fd)
+ {
+-    const size_t sizeof_ioinfo = sizeof(ioinfo) + pioinfo_extra;
+-    return (ioinfo*)((char*)__pioinfo[fd >> IOINFO_L2E] +
+-                     (fd & (IOINFO_ARRAY_ELTS - 1)) * sizeof_ioinfo);
+-}
++//     Debug(fprintf(stderr, "_pioinfo(%d) (size: %d)\n", fd, __pioinfo_size));
++    if (fd < 0 || fd > __pioinfo_size)
++        return NULL;
+ 
+-#define _set_osfhnd(fh, osfh) (void)(_osfhnd(fh) = osfh)
+-#define _set_osflags(fh, flags) (_osfile(fh) = (flags))
++    return &__pioinfo[fd];
++}
+ 
+-#define FOPEN			0x01	/* file handle open */
+-#define FEOFLAG			0x02	/* end of file has been encountered */
+-#define FPIPE			0x08	/* file handle refers to a pipe */
+-#define FNOINHERIT		0x10	/* file handle opened O_NOINHERIT */
+-#define FAPPEND			0x20	/* file handle opened O_APPEND */
+-#define FDEV			0x40	/* file handle refers to device */
+-#define FTEXT			0x80	/* file handle is in text mode */
++static int rb_w32_alloc_osfhandle(intptr_t osfhandle) {
++    int fd;
++    for( fd = 0; fd < __pioinfo_size; fd++ ) {
++        if( __pioinfo[fd].osfhnd == (intptr_t)INVALID_HANDLE_VALUE )
++            break; /* unused slot */
++    }
++    if( fd == __pioinfo_size ) {
++        /* no free slot */
++        __pioinfo_size += 1;
++//        __pioinfo = REALLOC_N( __pioinfo, ioinfo, __pioinfo_size + 1 );
++        __pioinfo = (ioinfo*)realloc( __pioinfo, sizeof(ioinfo) * __pioinfo_size );
++    }
++    memset(&__pioinfo[fd], 0, sizeof(ioinfo));
++    __pioinfo[fd].osfhnd = osfhandle;
++    __pioinfo[fd].osfile = FTEXT;
++    InitializeCriticalSection(&__pioinfo[fd].lock);
++
++    Debug(fprintf(stderr, "rb_w32_alloc_osfhandle: %d (%p) (size: %d)\n", fd, TO_HANDLE(fd), __pioinfo_size));
++    return fd;
++}
+ 
+ static int is_socket(SOCKET);
+ static int is_console(SOCKET);
+@@ -2698,13 +2631,19 @@ rb_w32_io_cancelable_p(int fd)
+     return is_socket(TO_SOCKET(fd)) || !is_console(TO_SOCKET(fd));
+ }
+ 
++/* License: Ruby's */
++SOCKET
++rb_w32_get_osfhandle(int fh)
++{
++    return _pioinfo(fh)->osfhnd;
++}
++
+ /* License: Ruby's */
+ static int
+ rb_w32_open_osfhandle(intptr_t osfhandle, int flags)
+ {
+     int fh;
+     char fileflags;		/* _osfile flags */
+-    HANDLE hF;
+ 
+     /* copy relevant flags from second parameter */
+     fileflags = FDEV;
+@@ -2718,10 +2657,8 @@ rb_w32_open_osfhandle(intptr_t osfhandle, int flags)
+     if (flags & O_NOINHERIT)
+         fileflags |= FNOINHERIT;
+ 
+-    /* attempt to allocate a C Runtime file handle */
+-    hF = CreateFile("NUL", 0, 0, NULL, OPEN_ALWAYS, 0, NULL);
+-    fh = _open_osfhandle((intptr_t)hF, 0);
+-    CloseHandle(hF);
++    /* allocate a C Runtime file handle */
++    fh = rb_w32_alloc_osfhandle(osfhandle);
+     if (fh == -1) {
+         errno = EMFILE;		/* too many open files */
+         _doserrno = 0L;		/* not an OS error */
+@@ -2729,8 +2666,6 @@ rb_w32_open_osfhandle(intptr_t osfhandle, int flags)
+     else {
+ 
+         rb_acrt_lowio_lock_fh(fh);
+-        /* the file is open. now, set the info in _osfhnd array */
+-        _set_osfhnd(fh, osfhandle);
+ 
+         fileflags |= FOPEN;		/* mark as open */
+ 
+@@ -2752,6 +2687,14 @@ init_stdhandle(void)
+      ((nullfd == (fd)) ? (keep = 1) : dup2(nullfd, fd)),	\
+      (fd))
+ 
++    rb_w32_alloc_osfhandle( STD_INPUT_HANDLE );
++    rb_w32_alloc_osfhandle( STD_OUTPUT_HANDLE );
++    rb_w32_alloc_osfhandle( STD_ERROR_HANDLE );
++    // rb_w32_alloc_osfhandle( (HANDLE)GetStdHandle(STD_INPUT_HANDLE) );
++    // rb_w32_alloc_osfhandle( (HANDLE)GetStdHandle(STD_OUTPUT_HANDLE) );
++    // rb_w32_alloc_osfhandle( (HANDLE)GetStdHandle(STD_ERROR_HANDLE) );
++
++    /* TODO: replace non-console stdin/out handling */
+     if (fileno(stdin) < 0) {
+         FILE_FILENO(stdin) = open_null(0);
+     }
+@@ -4458,7 +4401,7 @@ dupfd(HANDLE hDup, int flags, int minfd)
+     int filled = 0;
+ 
+     do {
+-        ret = _open_osfhandle((intptr_t)hDup, flags | FOPEN);
++        ret = rb_w32_open_osfhandle((intptr_t)hDup, flags | FOPEN);
+         if (ret == -1) {
+             goto close_fds_and_return;
+         }
+@@ -4501,7 +4444,7 @@ fcntl(int fd, int cmd, ...)
+         int ret;
+         HANDLE hDup;
+         flag = _osfile(fd);
+-        if (!(DuplicateHandle(GetCurrentProcess(), (HANDLE)_get_osfhandle(fd),
++        if (!(DuplicateHandle(GetCurrentProcess(), (HANDLE)rb_w32_get_osfhandle(fd),
+                               GetCurrentProcess(), &hDup, 0L,
+                               cmd == F_DUPFD && !(flag & FNOINHERIT),
+                               DUPLICATE_SAME_ACCESS))) {
+@@ -4519,10 +4462,12 @@ fcntl(int fd, int cmd, ...)
+             flag &= ~FNOINHERIT;
+         if ((ret = dupfd(hDup, flag, arg)) == -1)
+             CloseHandle(hDup);
++
++        Debug(fprintf(stderr, "fcntl(F_DUPFD): oldfd:%d (%p), newfd:%d (%p)\n", fd, TO_HANDLE(fd), ret, TO_HANDLE(ret)));
+         return ret;
+       }
+       case F_GETFD: {
+-        SIGNED_VALUE h = _get_osfhandle(fd);
++        SIGNED_VALUE h = rb_w32_get_osfhandle(fd);
+         if (h == -1) return -1;
+         if (!GetHandleInformation((HANDLE)h, &flag)) {
+             errno = map_errno(GetLastError());
+@@ -4531,7 +4476,7 @@ fcntl(int fd, int cmd, ...)
+         return (flag & HANDLE_FLAG_INHERIT) ? 0 : FD_CLOEXEC;
+       }
+       case F_SETFD: {
+-        SIGNED_VALUE h = _get_osfhandle(fd);
++        SIGNED_VALUE h = rb_w32_get_osfhandle(fd);
+         if (h == -1) return -1;
+         va_start(va, cmd);
+         arg = va_arg(va, int);
+@@ -5611,33 +5556,36 @@ static DWORD stati128_handle(HANDLE h, struct stati128 *st);
+ 
+ #undef fstat
+ /* License: Ruby's */
+-int
+-rb_w32_fstat(int fd, struct stat *st)
+-{
+-    BY_HANDLE_FILE_INFORMATION info;
+-    int ret = fstat(fd, st);
+-
+-    if (ret) return ret;
+-    if (GetEnvironmentVariableW(L"TZ", NULL, 0) == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return ret;
+-    if (GetFileInformationByHandle((HANDLE)_get_osfhandle(fd), &info)) {
+-        st->st_atime = filetime_to_unixtime(&info.ftLastAccessTime);
+-        st->st_mtime = filetime_to_unixtime(&info.ftLastWriteTime);
+-        st->st_ctime = filetime_to_unixtime(&info.ftCreationTime);
+-    }
+-    return ret;
+-}
++// int
++// rb_w32_fstat(int fd, struct stat *st)
++// {
++//     BY_HANDLE_FILE_INFORMATION info;
++//     int ret = fstat(fd, st);
++//
++//     if (ret) return ret;
++//     if (GetEnvironmentVariableW(L"TZ", NULL, 0) == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) return ret;
++//     if (GetFileInformationByHandle((HANDLE)rb_w32_get_osfhandle(fd), &info)) {
++//         st->st_atime = filetime_to_unixtime(&info.ftLastAccessTime);
++//         st->st_mtime = filetime_to_unixtime(&info.ftLastWriteTime);
++//         st->st_ctime = filetime_to_unixtime(&info.ftCreationTime);
++//     }
++//     return ret;
++// }
+ 
+ /* License: Ruby's */
+ int
+ rb_w32_fstati128(int fd, struct stati128 *st)
+ {
+-    struct stat tmp;
+-    int ret = fstat(fd, &tmp);
++    DWORD attr;
++//     struct stat tmp;
++//     int ret = fstat(fd, &tmp);
++//
++//     if (ret) return ret;
++//     COPY_STAT(tmp, *st, +);
++    st->st_dev = st->st_rdev = 0;
+ 
+-    if (ret) return ret;
+-    COPY_STAT(tmp, *st, +);
+-    stati128_handle((HANDLE)_get_osfhandle(fd), st);
+-    return ret;
++    attr = stati128_handle((HANDLE)rb_w32_get_osfhandle(fd), st);
++    return attr == (DWORD)-1 ? -1 : 0;
+ }
+ 
+ #if !defined FILE_INVALID_FILE_ID && !defined __MINGW32__
+@@ -6044,12 +5992,43 @@ rb_w32_lstati128(const char *path, struct stati128 *st)
+ rb_off_t
+ rb_w32_lseek(int fd, rb_off_t ofs, int whence)
+ {
++    LARGE_INTEGER liDistanceToMove;
++    LARGE_INTEGER lNewFilePointer;
++    DWORD dwMoveMethod;
+     SOCKET sock = TO_SOCKET(fd);
++
+     if (is_socket(sock) || is_pipe(sock)) {
+         errno = ESPIPE;
+         return -1;
+     }
+-    return _lseeki64(fd, ofs, whence);
++
++    switch(whence) {
++        case SEEK_SET:
++            dwMoveMethod = FILE_BEGIN;
++            break;
++        case SEEK_CUR:
++            dwMoveMethod = FILE_CURRENT;
++            break;
++        case SEEK_END:
++            dwMoveMethod = FILE_END;
++            break;
++        default:
++            rb_bug("rb_w32_lseek() invalid whence");
++    }
++
++    liDistanceToMove.QuadPart = ofs;
++
++//     return _lseeki64(fd, ofs, whence);
++    if (!SetFilePointerEx(
++            TO_HANDLE(fd),
++            liDistanceToMove,
++            &lNewFilePointer,
++            dwMoveMethod
++        )) {
++        errno = map_errno(GetLastError());
++        return -1;
++    }
++    return lNewFilePointer.QuadPart;
+ }
+ 
+ /* License: Ruby's */
+@@ -6152,7 +6131,7 @@ rb_w32_ftruncate(int fd, rb_off_t length)
+ {
+     HANDLE h;
+ 
+-    h = (HANDLE)_get_osfhandle(fd);
++    h = (HANDLE)rb_w32_get_osfhandle(fd);
+     if (h == (HANDLE)-1) return -1;
+     return rb_chsize(h, length);
+ }
+@@ -6260,11 +6239,11 @@ rb_w32_asynchronize(asynchronous_func_t func, uintptr_t self,
+ 
+                 memset(&m, 0, sizeof(m));
+                 if (!VirtualQuery(arg.stackaddr, &m, sizeof(m))) {
+-                    Debug(fprintf(stderr, "couldn't get stack base:%p:%d\n",
++                    Debug(fprintf(stderr, "couldn't get stack base:%p:%lud\n",
+                                   arg.stackaddr, GetLastError()));
+                 }
+                 else if (!VirtualFree(m.AllocationBase, 0, MEM_RELEASE)) {
+-                    Debug(fprintf(stderr, "couldn't release stack:%p:%d\n",
++                    Debug(fprintf(stderr, "couldn't release stack:%p:%lud\n",
+                                   m.AllocationBase, GetLastError()));
+                 }
+                 errno = EINTR;
+@@ -6380,12 +6359,41 @@ STATIC_ASSERT(std_handle, (STD_OUTPUT_HANDLE-STD_INPUT_HANDLE)==(STD_ERROR_HANDL
+ int
+ rb_w32_dup2(int oldfd, int newfd)
+ {
+-    int ret;
++    SOCKET h_dup;
+ 
+     if (oldfd == newfd) return newfd;
+-    ret = dup2(oldfd, newfd);
+-    if (ret < 0) return ret;
++//     ret = dup2(oldfd, newfd);
++//     if (ret < 0) return ret;
++
++    /* TODO: sockets must use dedicated function
++      if (is_socket(TO_SOCKET(oldfd)) {
++        int WSAAPI WSADuplicateSocketW(
++        [in]  SOCKET              s,
++        [in]  DWORD               dwProcessId,
++        [out] LPWSAPROTOCOL_INFOW lpProtocolInfo
++      );
++    */
++
++    if (DuplicateHandle(GetCurrentProcess(),
++        (HANDLE)TO_SOCKET(oldfd),
++        GetCurrentProcess(),
++        (HANDLE*)&h_dup,
++        0,
++        TRUE,
++        DUPLICATE_SAME_ACCESS) == 0)
++    {
++        errno = map_errno(GetLastError());
++        return -1;
++    }
++
++    if (TO_SOCKET(newfd) != INVALID_SOCKET){
++        rb_w32_close(newfd);
++    }
++
++    _set_osfhnd(newfd, h_dup);
+     set_new_std_fd(newfd);
++
++    Debug(fprintf(stderr, "rb_w32_dup2: oldfd:%d (%p), newfd:%d (%p)\n", oldfd, TO_HANDLE(oldfd), newfd, TO_HANDLE(newfd)));
+     return newfd;
+ }
+ 
+@@ -6473,20 +6481,20 @@ w32_wopen(const WCHAR *file, int oflag, int pmode)
+ 
+     share_delete = oflag & O_SHARE_DELETE ? FILE_SHARE_DELETE : 0;
+     oflag &= ~O_SHARE_DELETE;
+-    if ((oflag & O_TEXT) || !(oflag & O_BINARY)) {
+-        fd = _wopen(file, oflag, pmode);
+-        if (fd == -1) {
+-            switch (errno) {
+-              case EACCES:
+-                check_if_wdir(file);
+-                break;
+-              case EINVAL:
+-                errno = map_errno(GetLastError());
+-                break;
+-            }
+-        }
+-        return fd;
+-    }
++//     if ((oflag & O_TEXT) || !(oflag & O_BINARY)) {
++//         fd = _wopen(file, oflag, pmode);
++//         if (fd == -1) {
++//             switch (errno) {
++//               case EACCES:
++//                 check_if_wdir(file);
++//                 break;
++//               case EINVAL:
++//                 errno = map_errno(GetLastError());
++//                 break;
++//             }
++//         }
++//         return fd;
++//     }
+ 
+     sec.nLength = sizeof(sec);
+     sec.lpSecurityDescriptor = NULL;
+@@ -6580,17 +6588,12 @@ w32_wopen(const WCHAR *file, int oflag, int pmode)
+ 
+     /* allocate a C Runtime file handle */
+     RUBY_CRITICAL {
+-        h = CreateFile("NUL", 0, 0, NULL, OPEN_ALWAYS, 0, NULL);
+-        fd = _open_osfhandle((intptr_t)h, 0);
+-        CloseHandle(h);
+-    }
+-    if (fd == -1) {
+-        errno = EMFILE;
+-        return -1;
+-    }
+-    RUBY_CRITICAL {
++        fd = rb_w32_alloc_osfhandle((intptr_t)INVALID_HANDLE_VALUE);
++        if (fd == -1) {
++            errno = EMFILE;
++            goto quit;
++        }
+         rb_acrt_lowio_lock_fh(fd);
+-        _set_osfhnd(fd, (intptr_t)INVALID_HANDLE_VALUE);
+         _set_osflags(fd, 0);
+ 
+         h = CreateFileW(file, access, FILE_SHARE_READ | FILE_SHARE_WRITE | share_delete, &sec, create, attr, NULL);
+@@ -6639,7 +6642,7 @@ rb_w32_fclose(FILE *fp)
+     SOCKET sock = TO_SOCKET(fd);
+     int save_errno = errno;
+ 
+-    if (fflush(fp)) return -1;
++//     if (fflush(fp)) return -1;
+     if (!is_socket(sock)) {
+         UnlockFile((HANDLE)sock, 0, 0, LK_LEN, LK_LEN);
+         return fclose(fp);
+@@ -6654,6 +6657,22 @@ rb_w32_fclose(FILE *fp)
+     return 0;
+ }
+ 
++/* License: Ruby's */
++int
++rb_w32_setmode(int fd, int mode)
++{
++    int oldflags = _osfile(fd);
++    int newflags = oldflags;
++
++    if (mode & O_TEXT)
++        newflags |= FTEXT;
++    else
++        newflags &= ~FTEXT;
++    _set_osflags(fd, newflags);
++
++    return oldflags & FTEXT ? O_TEXT : O_BINARY;
++}
++
+ /* License: Ruby's */
+ int
+ rb_w32_pipe(int fds[2])
+@@ -6668,7 +6687,7 @@ rb_w32_pipe(int fds[2])
+     };
+     char name[sizeof(prefix) + width_of_ids];
+     SECURITY_ATTRIBUTES sec;
+-    HANDLE hRead, hWrite, h;
++    HANDLE hRead, hWrite;
+     int fdRead, fdWrite;
+     int ret;
+ 
+@@ -6705,9 +6724,7 @@ rb_w32_pipe(int fds[2])
+ 
+     RUBY_CRITICAL do {
+         ret = 0;
+-        h = CreateFile("NUL", 0, 0, NULL, OPEN_ALWAYS, 0, NULL);
+-        fdRead = _open_osfhandle((intptr_t)h, 0);
+-        CloseHandle(h);
++        fdRead = rb_w32_alloc_osfhandle((intptr_t)hRead);
+         if (fdRead == -1) {
+             errno = EMFILE;
+             CloseHandle(hWrite);
+@@ -6717,7 +6734,6 @@ rb_w32_pipe(int fds[2])
+         }
+ 
+         rb_acrt_lowio_lock_fh(fdRead);
+-        _set_osfhnd(fdRead, (intptr_t)hRead);
+         _set_osflags(fdRead, FOPEN | FPIPE | FNOINHERIT);
+         rb_acrt_lowio_unlock_fh(fdRead);
+     } while (0);
+@@ -6725,9 +6741,7 @@ rb_w32_pipe(int fds[2])
+         return ret;
+ 
+     RUBY_CRITICAL do {
+-        h = CreateFile("NUL", 0, 0, NULL, OPEN_ALWAYS, 0, NULL);
+-        fdWrite = _open_osfhandle((intptr_t)h, 0);
+-        CloseHandle(h);
++        fdWrite = rb_w32_alloc_osfhandle((intptr_t)hWrite);
+         if (fdWrite == -1) {
+             errno = EMFILE;
+             CloseHandle(hWrite);
+@@ -6735,7 +6749,6 @@ rb_w32_pipe(int fds[2])
+             break;
+         }
+         rb_acrt_lowio_lock_fh(fdWrite);
+-        _set_osfhnd(fdWrite, (intptr_t)hWrite);
+         _set_osflags(fdWrite, FOPEN | FPIPE | FNOINHERIT);
+         rb_acrt_lowio_unlock_fh(fdWrite);
+     } while (0);
+@@ -6747,6 +6760,8 @@ rb_w32_pipe(int fds[2])
+     fds[0] = fdRead;
+     fds[1] = fdWrite;
+ 
++    Debug(fprintf(stderr, "rb_w32_pipe: readfd:%d (%p), writefd:%d (%p)\n", fdRead, TO_HANDLE(fdRead), fdWrite, TO_HANDLE(fdWrite)));
++
+     return 0;
+ }
+ 
+@@ -7164,13 +7179,15 @@ rb_w32_close(int fd)
+     int save_errno = errno;
+ 
+     if (!is_socket(sock)) {
++        Debug(fprintf(stderr, "rb_w32_close(nonsocket): fd:%d (%p)\n", fd, TO_HANDLE(fd)));
+         UnlockFile((HANDLE)sock, 0, 0, LK_LEN, LK_LEN);
+         constat_delete((HANDLE)sock);
+-        return _close(fd);
++        return CloseHandle((HANDLE)sock);
+     }
++    Debug(fprintf(stderr, "rb_w32_close(socket): fd:%d (%p)\n", fd, TO_HANDLE(fd)));
+     _set_osfhnd(fd, (SOCKET)INVALID_HANDLE_VALUE);
+     socklist_delete(&sock, NULL);
+-    _close(fd);
++//     _close(fd);
+     errno = save_errno;
+     if (closesocket(sock) == SOCKET_ERROR) {
+         errno = map_errno(WSAGetLastError());
+@@ -7190,7 +7207,7 @@ setup_overlapped(OVERLAPPED *ol, int fd, int iswrite)
+          * it can read from everywhere.
+          */
+         DWORD method = ((_osfile(fd) & FAPPEND) && iswrite) ? FILE_END : FILE_CURRENT;
+-        DWORD low = SetFilePointer((HANDLE)_osfhnd(fd), 0, &high, method);
++        DWORD low = SetFilePointer(TO_HANDLE(fd), 0, &high, method);
+ #ifndef INVALID_SET_FILE_POINTER
+ #define INVALID_SET_FILE_POINTER ((DWORD)-1)
+ #endif
+@@ -7222,7 +7239,7 @@ finish_overlapped(OVERLAPPED *ol, int fd, DWORD size)
+         DWORD low = ol->Offset + size;
+         if (low < ol->Offset)
+             ++high;
+-        SetFilePointer((HANDLE)_osfhnd(fd), low, &high, FILE_BEGIN);
++        SetFilePointer(TO_HANDLE(fd), low, &high, FILE_BEGIN);
+     }
+ }
+ 
+@@ -7245,17 +7262,30 @@ rb_w32_read(int fd, void *buf, size_t size)
+     if (is_socket(sock))
+         return rb_w32_recv(fd, buf, size, 0);
+ 
+-    // validate fd by using _get_osfhandle() because we cannot access _nhandle
+-    if (_get_osfhandle(fd) == -1) {
++    // validate fd by using rb_w32_get_osfhandle() because we cannot access _nhandle
++    if (TO_HANDLE(fd) == INVALID_HANDLE_VALUE) {
+         return -1;
+     }
+ 
++    rb_acrt_lowio_lock_fh(fd);
++
++    Debug(fprintf(stderr, "rb_w32_read: fd:%d (%p)\n", fd, TO_HANDLE(fd)));
+     if (_osfile(fd) & FTEXT) {
+-        return _read(fd, buf, size);
++//         return _read(fd, buf, size);
++        if (!ReadFile(TO_HANDLE(fd), buf, size, &read, NULL)) {
++            int ret = 0;
++            err = GetLastError();
++            if (err != ERROR_BROKEN_PIPE) {
++                errno = map_errno(err);
++                ret = -1;
++            }
++            rb_acrt_lowio_unlock_fh(fd);
++            return ret;
++        }
++        rb_acrt_lowio_unlock_fh(fd);
++        return read;
+     }
+ 
+-    rb_acrt_lowio_lock_fh(fd);
+-
+     if (!size || _osfile(fd) & FEOFLAG) {
+         _set_osflags(fd, _osfile(fd) & ~FEOFLAG);
+         rb_acrt_lowio_unlock_fh(fd);
+@@ -7263,16 +7293,16 @@ rb_w32_read(int fd, void *buf, size_t size)
+     }
+ 
+     ret = 0;
+-    isconsole = is_console(_osfhnd(fd)) && (osver.dwMajorVersion < 6 || (osver.dwMajorVersion == 6 && osver.dwMinorVersion < 2));
++    isconsole = is_console(TO_SOCKET(fd)) && (osver.dwMajorVersion < 6 || (osver.dwMajorVersion == 6 && osver.dwMinorVersion < 2));
+     if (isconsole) {
+         DWORD mode;
+-        GetConsoleMode((HANDLE)_osfhnd(fd),&mode);
++        GetConsoleMode(TO_HANDLE(fd),&mode);
+         islineinput = (mode & ENABLE_LINE_INPUT) != 0;
+     }
+   retry:
+     /* get rid of console reading bug */
+     if (isconsole) {
+-        constat_reset((HANDLE)_osfhnd(fd));
++        constat_reset(TO_HANDLE(fd));
+         if (start)
+             len = 1;
+         else {
+@@ -7289,11 +7319,11 @@ rb_w32_read(int fd, void *buf, size_t size)
+         return -1;
+     }
+ 
+-    if (!ReadFile((HANDLE)_osfhnd(fd), buf, len, &read, &ol)) {
++    if (!ReadFile(TO_HANDLE(fd), buf, len, &read, &ol)) {
+         err = GetLastError();
+         if (err == ERROR_NO_DATA && (_osfile(fd) & FPIPE)) {
+             DWORD state;
+-            if (GetNamedPipeHandleState((HANDLE)_osfhnd(fd), &state, NULL, NULL, NULL, NULL, 0) && (state & PIPE_NOWAIT)) {
++            if (GetNamedPipeHandleState(TO_HANDLE(fd), &state, NULL, NULL, NULL, NULL, 0) && (state & PIPE_NOWAIT)) {
+                 errno = EWOULDBLOCK;
+             }
+             else {
+@@ -7324,12 +7354,12 @@ rb_w32_read(int fd, void *buf, size_t size)
+             else
+                 errno = map_errno(GetLastError());
+             CloseHandle(ol.hEvent);
+-            CancelIo((HANDLE)_osfhnd(fd));
++            CancelIo(TO_HANDLE(fd));
+             rb_acrt_lowio_unlock_fh(fd);
+             return -1;
+         }
+ 
+-        if (!GetOverlappedResult((HANDLE)_osfhnd(fd), &ol, &read, TRUE) &&
++        if (!GetOverlappedResult(TO_HANDLE(fd), &ol, &read, TRUE) &&
+             (err = GetLastError()) != ERROR_HANDLE_EOF) {
+             int ret = 0;
+             if (err != ERROR_BROKEN_PIPE) {
+@@ -7337,7 +7367,7 @@ rb_w32_read(int fd, void *buf, size_t size)
+                 ret = -1;
+             }
+             CloseHandle(ol.hEvent);
+-            CancelIo((HANDLE)_osfhnd(fd));
++            CancelIo(TO_HANDLE(fd));
+             rb_acrt_lowio_unlock_fh(fd);
+             return ret;
+         }
+@@ -7381,22 +7411,27 @@ rb_w32_write(int fd, const void *buf, size_t size)
+     if (is_socket(sock))
+         return rb_w32_send(fd, buf, size, 0);
+ 
+-    // validate fd by using _get_osfhandle() because we cannot access _nhandle
+-    if (_get_osfhandle(fd) == -1) {
++    // validate fd by using rb_w32_get_osfhandle() because we cannot access _nhandle
++    if (TO_HANDLE(fd) == INVALID_HANDLE_VALUE) {
+         return -1;
+     }
+ 
++    rb_acrt_lowio_lock_fh(fd);
++
+     if ((_osfile(fd) & FTEXT) &&
+         (!(_osfile(fd) & FPIPE) || fd == fileno(stdout) || fd == fileno(stderr))) {
+-        ssize_t w = _write(fd, buf, size);
+-        if (w == (ssize_t)-1 && errno == EINVAL) {
+-            errno = map_errno(GetLastError());
++
++        if (!WriteFile(TO_HANDLE(fd), buf, size, &written, NULL)) {
++            err = GetLastError();
++            errno = map_errno(err);
++
++            rb_acrt_lowio_unlock_fh(fd);
++            return -1;
+         }
+-        return w;
++        rb_acrt_lowio_unlock_fh(fd);
++        return written;
+     }
+ 
+-    rb_acrt_lowio_lock_fh(fd);
+-
+     if (!size || _osfile(fd) & FEOFLAG) {
+         rb_acrt_lowio_unlock_fh(fd);
+         return 0;
+@@ -7413,7 +7448,7 @@ rb_w32_write(int fd, const void *buf, size_t size)
+         return -1;
+     }
+ 
+-    if (!WriteFile((HANDLE)_osfhnd(fd), buf, len, &written, &ol)) {
++    if (!WriteFile(TO_HANDLE(fd), buf, len, &written, &ol)) {
+         err = GetLastError();
+         if (err != ERROR_IO_PENDING) {
+             CloseHandle(ol.hEvent);
+@@ -7433,15 +7468,15 @@ rb_w32_write(int fd, const void *buf, size_t size)
+             else
+                 errno = map_errno(GetLastError());
+             CloseHandle(ol.hEvent);
+-            CancelIo((HANDLE)_osfhnd(fd));
++            CancelIo(TO_HANDLE(fd));
+             rb_acrt_lowio_unlock_fh(fd);
+             return -1;
+         }
+ 
+-        if (!GetOverlappedResult((HANDLE)_osfhnd(fd), &ol, &written, TRUE)) {
++        if (!GetOverlappedResult(TO_HANDLE(fd), &ol, &written, TRUE)) {
+             errno = map_errno(GetLastError());
+             CloseHandle(ol.hEvent);
+-            CancelIo((HANDLE)_osfhnd(fd));
++            CancelIo(TO_HANDLE(fd));
+             rb_acrt_lowio_unlock_fh(fd);
+             return -1;
+         }
+@@ -7484,7 +7519,7 @@ rb_w32_write_console(uintptr_t strarg, int fd)
+     struct constat *s;
+     long len;
+ 
+-    handle = (HANDLE)_osfhnd(fd);
++    handle = TO_HANDLE(fd);
+     if (!GetConsoleMode(handle, &dwMode))
+         return -1L;
+ 
+@@ -7901,7 +7936,7 @@ fchmod(int fd, int mode)
+         LARGE_INTEGER ChangeTime;
+         DWORD         FileAttributes;
+     } info = {{{0}}, {{0}}, {{0}},}; /* fields with 0 are unchanged */
+-    HANDLE h = (HANDLE)_get_osfhandle(fd);
++    HANDLE h = (HANDLE)rb_w32_get_osfhandle(fd);
+ 
+     if (h == INVALID_HANDLE_VALUE) {
+         errno = EBADF;
+@@ -7932,11 +7967,11 @@ rb_w32_isatty(int fd)
+ {
+     DWORD mode;
+ 
+-    // validate fd by using _get_osfhandle() because we cannot access _nhandle
+-    if (_get_osfhandle(fd) == -1) {
++    // validate fd by using rb_w32_get_osfhandle() because we cannot access _nhandle
++    if (TO_HANDLE(fd) == INVALID_HANDLE_VALUE) {
+         return 0;
+     }
+-    if (!GetConsoleMode((HANDLE)_osfhnd(fd), &mode)) {
++    if (!GetConsoleMode(TO_HANDLE(fd), &mode)) {
+         errno = ENOTTY;
+         return 0;
+     }
+@@ -8168,7 +8203,7 @@ rb_w32_unwrap_io_handle(int fd)
+     else {
+         socklist_delete(&sock, NULL);
+     }
+-    return _close(fd);
++    return 0; //_close(fd);
+ }
+ 
+ #if !defined(__MINGW64__) && defined(__MINGW64_VERSION_MAJOR)

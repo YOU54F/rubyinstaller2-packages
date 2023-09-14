@@ -23,6 +23,7 @@ source=("https://cache.ruby-lang.org/pub/ruby/${pkgver2%.*}/${_realname}-${pkgve
         0001-Add-C-ext-win32-dll_directory-as-an-alternative-to-f.patch
         0002-Don-t-add-an-exe-file-manifest.patch
         0006-Windows-Prefer-USERPROFILE-over-HOMEPATH-on-startup-.patch
+        0007-Windows-aarch64-not-useful.patch
         ruby.ico
         rubyw.ico)
 
@@ -41,6 +42,7 @@ prepare() {
   patch -p1 -i ${srcdir}/0001-Add-C-ext-win32-dll_directory-as-an-alternative-to-f.patch
   patch -p1 -i ${srcdir}/0002-Don-t-add-an-exe-file-manifest.patch
   patch -p1 -i ${srcdir}/0006-Windows-Prefer-USERPROFILE-over-HOMEPATH-on-startup-.patch -l
+  patch -p1 -i ${srcdir}/0007-Windows-aarch64-not-useful.patch -l
 }
 
 build() {
